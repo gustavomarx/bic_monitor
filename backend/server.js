@@ -5,6 +5,7 @@ const cors    = require('cors');
 const multer  = require('multer');
 const path    = require('path');
 const fs      = require('fs');
+const crypto  = require('crypto');
 const { google } = require('googleapis');
 const oracledb  = require('oracledb');
 const XLSX      = require('xlsx');
@@ -79,6 +80,52 @@ async function renameFileToOld(drive, fileId, currentName) {
 }
 
 // ─────────────────────────────────────────
+//  Utilitário — hash dos dados (não do arquivo: o xlsx embute timestamps)
+// ─────────────────────────────────────────
+function hashData(data) {
+  const input = Buffer.isBuffer(data) ? data : JSON.stringify(data);
+  return crypto.createHash('sha256').update(input).digest('hex');
+}
+
+// ─────────────────────────────────────────
+//  Utilitário — sobe o XLSX do dia evitando duplicatas
+//  Se já existe arquivo do dia com o mesmo dataHash, não sobe nada.
+//  Caso contrário, renomeia os existentes para [OLD] e sobe o novo.
+// ─────────────────────────────────────────
+async function uploadDailyXlsx(drive, folderId, filename, buffer, dataHash) {
+  const listResp = await drive.files.list({
+    q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
+    fields:                    'files(id, name, appProperties)',
+    pageSize:                  100,
+    supportsAllDrives:         true,
+    includeItemsFromAllDrives: true,
+  });
+  const existentes = listResp.data.files || [];
+
+  const igual = existentes.find(f => f.appProperties && f.appProperties.dataHash === dataHash);
+  if (igual) {
+    console.log(`[Drive] "${filename}" sem alterações — upload ignorado.`);
+    return { id: igual.id, name: igual.name, skipped: true };
+  }
+
+  for (const f of existentes) {
+    await renameFileToOld(drive, f.id, f.name);
+  }
+
+  const { Readable } = require('stream');
+  const stream = new Readable();
+  stream.push(buffer);
+  stream.push(null);
+
+  const resp = await drive.files.create({
+    requestBody: { name: filename, parents: [folderId], appProperties: { dataHash } },
+    media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
+    fields: 'id, name', supportsAllDrives: true,
+  });
+  return { ...resp.data, skipped: false };
+}
+
+// ─────────────────────────────────────────
 //  Utilitário — parsear data do nome do arquivo
 //  Formato: relatorio_DD-MM-YYYY.xlsx
 // ─────────────────────────────────────────
@@ -135,34 +182,14 @@ async function saveRowsToDrive(rows) {
     const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
     const filename = buildFilename(new Date());
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields:                    'files(id, name)',
-      supportsAllDrives:         true,
-      includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
-
     const wsData = rows.map(r => ({ holding: r.holding, customer: r.customer, anomes: r.anomes, valor: r.valor }));
     const ws     = XLSX.utils.json_to_sheet(wsData);
     const wb     = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Dados');
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(buffer);
-    stream.push(null);
-
-    await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name', supportsAllDrives: true,
-    });
-    console.log(`[Drive] Histórico Oracle salvo: "${filename}".`);
+    const up = await uploadDailyXlsx(drive, folderId, filename, buffer, hashData(wsData));
+    if (!up.skipped) console.log(`[Drive] Histórico Oracle salvo: "${filename}".`);
   } catch (err) {
     console.error('[Drive] Erro ao salvar histórico Oracle:', err.message);
   }
@@ -331,39 +358,13 @@ app.post('/upload-drive', upload.single('arquivo'), async (req, res) => {
     const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
     const filename = buildFilename(new Date());
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields:                    'files(id, name)',
-      supportsAllDrives:         true,
-      includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
-
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(req.file.buffer);
-    stream.push(null);
-
-    const uploadResp = await drive.files.create({
-      requestBody: {
-        name:    filename,
-        parents: [folderId],
-      },
-      media: {
-        mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        body:     stream,
-      },
-      fields:            'id, name',
-      supportsAllDrives: true,
-    });
+    const up = await uploadDailyXlsx(drive, folderId, filename, req.file.buffer, hashData(req.file.buffer));
 
     res.json({
       success:  true,
-      filename: uploadResp.data.name,
-      fileId:   uploadResp.data.id,
+      filename: up.name,
+      fileId:   up.id,
+      skipped:  up.skipped,
     });
   } catch (err) {
     console.error('[Drive] Erro ao fazer upload:', err.message);
@@ -552,18 +553,6 @@ async function saveInativToDrive({ dataInicio, dataFim, detalhe, cnpjMap }) {
     const { baseName } = buildInativFilename();
     const filename = `${baseName}.xlsx`;
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields:                    'files(id, name)',
-      pageSize:                  1000,
-      supportsAllDrives:         true,
-      includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
-
     // Montar aba Detalhe com todas as datas brutas
     const nomeDia = ['Domingo','Segunda-feira','Terca-feira','Quarta-feira','Quinta-feira','Sexta-feira','Sabado'];
     const detalheRows = [];
@@ -601,18 +590,10 @@ async function saveInativToDrive({ dataInicio, dataFim, detalhe, cnpjMap }) {
     XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(meta),        'Meta');
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(buffer);
-    stream.push(null);
-
-    await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name', supportsAllDrives: true,
-    });
-
-    console.log(`[Drive] Inatividade salva no Drive: "${filename}" (${detalheRows.length} ocorrências).`);
+    // geradoEm fica fora do hash — muda a cada execução
+    const dataHash = hashData({ dataInicio, dataFim, detalheRows });
+    const up = await uploadDailyXlsx(drive, folderId, filename, buffer, dataHash);
+    if (!up.skipped) console.log(`[Drive] Inatividade salva no Drive: "${filename}" (${detalheRows.length} ocorrências).`);
   } catch (err) {
     console.error('[Drive] Erro ao salvar inatividade:', err.message);
   }
@@ -631,31 +612,10 @@ app.post('/upload-inatividade', upload.single('file'), async (req, res) => {
     const { baseName } = buildInativFilename();
     const filename = `${baseName}.xlsx`;
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields:                    'files(id, name)',
-      pageSize:                  1000,
-      supportsAllDrives:         true,
-      includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
+    const up = await uploadDailyXlsx(drive, folderId, filename, req.file.buffer, hashData(req.file.buffer));
 
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(req.file.buffer);
-    stream.push(null);
-
-    const uploadResp = await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name', supportsAllDrives: true,
-    });
-
-    console.log(`[Drive] Inatividade salva: "${filename}".`);
-    res.json({ success: true, filename: uploadResp.data.name, fileId: uploadResp.data.id });
+    if (!up.skipped) console.log(`[Drive] Inatividade salva: "${filename}".`);
+    res.json({ success: true, filename: up.name, fileId: up.id, skipped: up.skipped });
   } catch (err) {
     console.error('[Drive] Erro ao salvar inatividade:', err.message);
     res.status(500).json({ error: 'Erro ao salvar no Drive: ' + err.message });
@@ -740,35 +700,13 @@ async function saveDeParaToDrive(rows) {
     const { baseName } = buildDeParaFilename();
     const filename = `${baseName}.xlsx`;
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields:                    'files(id, name)',
-      pageSize:                  1000,
-      supportsAllDrives:         true,
-      includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
-
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'De-Para');
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(buffer);
-    stream.push(null);
-
-    await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name', supportsAllDrives: true,
-    });
-
-    console.log(`[Drive] De-Para salvo no Drive: "${filename}" (${rows.length} linhas).`);
+    const up = await uploadDailyXlsx(drive, folderId, filename, buffer, hashData(rows));
+    if (!up.skipped) console.log(`[Drive] De-Para salvo no Drive: "${filename}" (${rows.length} linhas).`);
   } catch (err) {
     console.error('[Drive] Erro ao salvar De-Para:', err.message);
   }
@@ -912,18 +850,6 @@ async function saveHistoricoToDrive(rows) {
     const baseName = `historico_${d}-${mo}-${y}`;
     const filename = `${baseName}.xlsx`;
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields:                    'files(id, name)',
-      pageSize:                  1000,
-      supportsAllDrives:         true,
-      includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
-
     const wsData = rows.map(r => ({
       HOLDING:      r.holding,
       PARTNER_NAME: r.partnerName,
@@ -936,18 +862,8 @@ async function saveHistoricoToDrive(rows) {
     XLSX.utils.book_append_sheet(wb, ws, 'Histórico');
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(buffer);
-    stream.push(null);
-
-    await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name', supportsAllDrives: true,
-    });
-
-    console.log(`[Drive] Histórico salvo no Drive: "${filename}" (${rows.length} linhas).`);
+    const up = await uploadDailyXlsx(drive, folderId, filename, buffer, hashData(wsData));
+    if (!up.skipped) console.log(`[Drive] Histórico salvo no Drive: "${filename}" (${rows.length} linhas).`);
   } catch (err) {
     console.error('[Drive] Erro ao salvar histórico:', err.message);
   }
@@ -1255,51 +1171,26 @@ async function saveUsuariosToDrive() {
     const yyyy = now.getFullYear();
     const filename = `usuarios_${dd}-${mm}-${yyyy}.xlsx`;
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields:                    'files(id, name)',
-      supportsAllDrives:         true,
-      includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
-    const filename_final = filename;
-
     const [distribResult, industriaResult] = await Promise.all([
       pgPool.query(SQL_DISTRIB),
       pgPool.query(SQL_INDUSTRIA),
     ]);
 
-    const wsDistrib = XLSX.utils.json_to_sheet(
-      distribResult.rows.map(r => ({
-        Empresa:        r.account_name,
-        Nome:           r.user_name,
-        Email:          r.email,
-        Tem_Permissao:  r.has_permission ? 'Sim' : 'Não',
-      }))
-    );
-    const wsIndustria = XLSX.utils.json_to_sheet(
-      industriaResult.rows.map(r => ({ Nome: r.user_name, Email: r.email }))
-    );
+    const distribRows = distribResult.rows.map(r => ({
+      Empresa:        r.account_name,
+      Nome:           r.user_name,
+      Email:          r.email,
+      Tem_Permissao:  r.has_permission ? 'Sim' : 'Não',
+    }));
+    const industriaRows = industriaResult.rows.map(r => ({ Nome: r.user_name, Email: r.email }));
 
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, wsDistrib,   'Distribuidores');
-    XLSX.utils.book_append_sheet(wb, wsIndustria, 'Industria');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(distribRows),   'Distribuidores');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(industriaRows), 'Industria');
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(buffer);
-    stream.push(null);
-
-    await drive.files.create({
-      requestBody: { name: filename_final, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name', supportsAllDrives: true,
-    });
-    console.log(`[Drive] Usuários salvos: "${filename_final}" (${distribResult.rowCount} distrib. + ${industriaResult.rowCount} indústria).`);
+    const up = await uploadDailyXlsx(drive, folderId, filename, buffer, hashData({ distribRows, industriaRows }));
+    if (!up.skipped) console.log(`[Drive] Usuários salvos: "${filename}" (${distribResult.rowCount} distrib. + ${industriaResult.rowCount} indústria).`);
   } catch (err) {
     console.error('[Drive] Erro ao salvar usuários:', err.message);
   }
@@ -1420,30 +1311,8 @@ async function saveBatalhaNavalToDrive() {
     const baseName = `batalha_naval_${dateStr}`;
     const fileName = `${baseName}.xlsx`;
 
-    // Renomear arquivo existente do dia para [OLD] antes de subir o novo
-    const listResp = await drive.files.list({
-      q:                         `'${folderId}' in parents and name = '${fileName}' and trashed=false`,
-      fields:                    'files(id, name)',
-      includeItemsFromAllDrives: true,
-      supportsAllDrives:         true,
-    });
-    for (const f of (listResp.data.files || [])) {
-      await renameFileToOld(drive, f.id, f.name);
-    }
-
-    const { Readable } = require('stream');
-    const stream = new Readable();
-    stream.push(buffer);
-    stream.push(null);
-
-    await drive.files.create({
-      requestBody: { name: fileName, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name',
-      supportsAllDrives: true,
-    });
-
-    console.log(`[Drive] Batalha Naval salvo: "${fileName}" (${rows.length} linhas)`);
+    const up = await uploadDailyXlsx(drive, folderId, fileName, buffer, hashData(rows));
+    if (!up.skipped) console.log(`[Drive] Batalha Naval salvo: "${fileName}" (${rows.length} linhas)`);
     return { fileName, rowCount: rows.length };
   } catch (err) {
     console.error('[Drive] Erro ao salvar Batalha Naval:', err.message);
@@ -1540,27 +1409,11 @@ function buildBrDateStr() {
 }
 
 async function mdiasSaveXlsx(drive, folderId, filename, wsRows, sheetName) {
-  // Renomeia arquivo existente do mesmo dia para [OLD]
-  const listResp = await drive.files.list({
-    q: `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-    fields: 'files(id, name)', pageSize: 100,
-    supportsAllDrives: true, includeItemsFromAllDrives: true,
-  });
-  for (const f of (listResp.data.files || [])) {
-    await renameFileToOld(drive, f.id, f.name);
-  }
   const ws     = XLSX.utils.json_to_sheet(wsRows);
   const wb     = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, sheetName);
   const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-  const { Readable } = require('stream');
-  const stream = new Readable(); stream.push(buffer); stream.push(null);
-  const resp = await drive.files.create({
-    requestBody: { name: filename, parents: [folderId] },
-    media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-    fields: 'id, name', supportsAllDrives: true,
-  });
-  return resp.data;
+  return uploadDailyXlsx(drive, folderId, filename, buffer, hashData({ sheetName, wsRows }));
 }
 
 // ─── Comparativo Sellout MDias ────────────────────────────
@@ -1671,19 +1524,8 @@ app.post('/mdias/upload-drive', upload.single('arquivo'), async (req, res) => {
     const folderId = process.env.MDIAS_GOOGLE_DRIVE_COMPARATIVO_FOLDER_ID;
     if (!folderId) throw new Error('MDIAS_GOOGLE_DRIVE_COMPARATIVO_FOLDER_ID não configurado.');
     const filename = buildFilename(new Date());
-    const listResp = await drive.files.list({
-      q: `'${folderId}' in parents and name = '${filename}' and trashed = false`,
-      fields: 'files(id, name)', supportsAllDrives: true, includeItemsFromAllDrives: true,
-    });
-    for (const f of (listResp.data.files || [])) await renameFileToOld(drive, f.id, f.name);
-    const { Readable } = require('stream');
-    const stream = new Readable(); stream.push(req.file.buffer); stream.push(null);
-    const uploadResp = await drive.files.create({
-      requestBody: { name: filename, parents: [folderId] },
-      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: stream },
-      fields: 'id, name', supportsAllDrives: true,
-    });
-    res.json({ success: true, filename: uploadResp.data.name, fileId: uploadResp.data.id });
+    const up = await uploadDailyXlsx(drive, folderId, filename, req.file.buffer, hashData(req.file.buffer));
+    res.json({ success: true, filename: up.name, fileId: up.id, skipped: up.skipped });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
