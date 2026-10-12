@@ -1775,6 +1775,7 @@
         <span class="icon icon-sm">group</span>
         <h2>Usuários por Ambiente</h2>
         <button class="btn btn-sm" onclick="reloadUsuarios()"><span class="icon icon-sm">refresh</span> Atualizar</button>
+        <button class="btn btn-sm" id="btnCoordenadores" onclick="atualizarCoordenadores()" title="Consulta bigdata.partner_user_permission no BigQuery e salva coordenadores_DD-MM-AAAA.xlsx na pasta dos usuários (manual)"><span class="icon icon-sm">cloud_download</span> Coordenadores (BigQuery)</button>
       </div>
       <div class="usuarios-sub-nav">
         <button class="usuarios-sub-btn active" id="subBtnDistrib" onclick="switchUsuariosSub('distrib')">
@@ -6278,6 +6279,19 @@ var usuariosState = {
 function loadUsuariosIfNeeded() {
   if (!usuariosState.distrib.loaded)   fetchUsuarios('distrib');
   if (!usuariosState.industria.loaded) fetchUsuarios('industria');
+}
+
+// Coordenadores: consulta manual no BigQuery → Drive (não roda na atualização diária)
+function atualizarCoordenadores() {
+  var btn = document.getElementById('btnCoordenadores');
+  btn.disabled = true;
+  fetch(BACKEND + '/geral/coordenadores', { method: 'POST' })
+    .then(function(r) { return r.json().then(function(j) { if (!r.ok) throw new Error(j.error || r.statusText); return j; }); })
+    .then(function(j) {
+      showToast((j.skipped ? 'Coordenadores sem mudança' : 'Coordenadores salvos') + ': ' + j.linhas + ' linhas (' + j.arquivo + ')', 'success', 6000);
+    })
+    .catch(function(err) { showToast('Erro ao atualizar coordenadores: ' + err.message, 'error', 8000); })
+    .then(function() { btn.disabled = false; });
 }
 
 function reloadUsuarios() {

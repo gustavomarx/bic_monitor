@@ -1270,6 +1270,73 @@ async function saveUsuariosToDrive() {
   return { linhas: rows.length, skipped: !!up.skipped };
 }
 
+// ─────────────────────────────────────────
+//  GERAL — Coordenadores (BigQuery, só manual — fora da atualização diária)
+//  POST /geral/coordenadores → grava coordenadores_DD-MM-AAAA.xlsx na pasta dos usuários
+//  Fonte: bigdata.partner_user_permission (usuários da indústria vinculados a cada distribuidora)
+// ─────────────────────────────────────────
+const SQL_COORDENADORES = 'SELECT * FROM `bigdata.partner_user_permission`';
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+async function consultarCoordenadores() {
+  const { BigQuery } = require('@google-cloud/bigquery');
+  const bq = new BigQuery({ projectId: process.env.BIGQUERY_PROJECT_ID });
+  const [rows] = await bq.query({ query: SQL_COORDENADORES });
+
+  // Indústria pelo uuid (o organization_name da tabela varia: "BIC", "BIC BRASIL S.A.", "{nome_indistria}"…)
+  const porOrg = new Map(INDUSTRIAS_USUARIOS.map(i => [i.orgId, i.nome]));
+  const vistos = new Set();
+  const linhas = [];
+  for (const r of rows) {
+    const idInd  = String(r.uuid_organization || '').trim();
+    const idDist = String(r.uuid_organization_partner || '').trim();
+    const email  = String(r.email || '').trim().toLowerCase();
+    if (!UUID_RE.test(idDist) || !email.includes('@')) continue;
+    const chave = `${idInd}|${idDist}|${email}`;
+    if (vistos.has(chave)) continue;
+    vistos.add(chave);
+    linhas.push({
+      Industria:      porOrg.get(idInd) || String(r.organization_name || '').trim(),
+      Id_Industria:   idInd,
+      Id_Organizacao: idDist,
+      Empresa:        String(r.partner_name || '').trim(),
+      Nome:           String(r.user_name || '').trim(),
+      Email:          email,
+    });
+  }
+  linhas.sort((a, b) => a.Industria.localeCompare(b.Industria, 'pt-BR') || a.Empresa.localeCompare(b.Empresa, 'pt-BR') || a.Nome.localeCompare(b.Nome, 'pt-BR'));
+  return { linhas, lidas: rows.length };
+}
+
+async function saveCoordenadoresToDrive() {
+  const drive    = getDriveClient();
+  const folderId = process.env.GOOGLE_DRIVE_USUARIOS_FOLDER_ID;
+  const now  = new Date();
+  const dd   = String(now.getDate()).padStart(2, '0');
+  const mm   = String(now.getMonth() + 1).padStart(2, '0');
+  const filename = `coordenadores_${dd}-${mm}-${now.getFullYear()}.xlsx`;
+
+  const { linhas, lidas } = await consultarCoordenadores();
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(linhas), 'Coordenadores');
+  const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  const up = await uploadDailyXlsx(drive, folderId, filename, buffer, hashData(linhas));
+  console.log(`[Drive] Coordenadores ${up.skipped ? 'sem mudança' : 'salvos'}: "${filename}" (${linhas.length} de ${lidas} linhas do BigQuery).`);
+
+  const porIndustria = {};
+  for (const l of linhas) porIndustria[l.Industria] = (porIndustria[l.Industria] || 0) + 1;
+  return { arquivo: filename, linhas: linhas.length, lidas, skipped: !!up.skipped, porIndustria };
+}
+
+app.post('/geral/coordenadores', async (req, res) => {
+  try {
+    res.json({ ok: true, ...(await saveCoordenadoresToDrive()) });
+  } catch (err) {
+    console.error('[geral/coordenadores] Erro:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/geral/atualizar-tudo', async (req, res) => {
   res.setHeader('Content-Type',  'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
