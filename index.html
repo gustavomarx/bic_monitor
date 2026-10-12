@@ -759,6 +759,7 @@
     .all-tenant-badge.kibon      { background: #a21caf; }
     .all-tenant-badge.peccin     { background: #16a34a; }
     .all-tenant-badge.pepsico    { background: #004B93; }
+    .all-tenant-badge.geral      { background: #475569; }
     .all-tenant-msg { font-size: 11px; color: var(--text2); min-height: 14px; }
     .btn-update-all-tenants {
       background: linear-gradient(135deg, #F47920 0%, #7c3aed 100%) !important;
@@ -984,7 +985,6 @@
       <div class="upd-step-item" id="updS7"><span class="upd-step-icon">⬜</span>Salvar inatividade no Drive</div>
       <div class="upd-step-item" id="updS8"><span class="upd-step-icon">⬜</span>Salvar De → Para no Drive</div>
       <div class="upd-step-item" id="updS9"><span class="upd-step-icon">⬜</span>Salvar histórico de vendas no Drive</div>
-      <div class="upd-step-item" id="updS10"><span class="upd-step-icon">⬜</span>Salvar usuários no Drive</div>
       <div class="upd-step-item" id="updS11"><span class="upd-step-icon">⬜</span>Salvar Batalha Naval no Drive</div>
     </div>
   </div>
@@ -1016,7 +1016,6 @@
           <div class="upd-step-item" id="atS_bic_7"><span class="upd-step-icon">⬜</span>Salvar inatividade</div>
           <div class="upd-step-item" id="atS_bic_8"><span class="upd-step-icon">⬜</span>Salvar De → Para</div>
           <div class="upd-step-item" id="atS_bic_9"><span class="upd-step-icon">⬜</span>Salvar histórico</div>
-          <div class="upd-step-item" id="atS_bic_10"><span class="upd-step-icon">⬜</span>Salvar usuários</div>
           <div class="upd-step-item" id="atS_bic_11"><span class="upd-step-icon">⬜</span>Batalha Naval</div>
         </div>
       </div>
@@ -1252,6 +1251,18 @@
           <div class="upd-step-item" id="atS_pepsico_5"><span class="upd-step-icon">⬜</span>Salvar comparativo</div>
           <div class="upd-step-item" id="atS_pepsico_6"><span class="upd-step-icon">⬜</span>Salvar Batalha Naval</div>
           <div class="upd-step-item" id="atS_pepsico_7"><span class="upd-step-icon">⬜</span>Salvar histórico</div>
+        </div>
+      </div>
+      <!-- GERAL (sem vínculo de indústria) -->
+      <div class="all-tenant-col" id="atCol_geral">
+        <div class="all-tenant-col-header">
+          <span class="all-tenant-badge geral">GER</span> Geral
+          <span id="atStatus_geral" style="margin-left:auto;font-size:11px;color:var(--text3);">aguardando</span>
+        </div>
+        <div class="upd-bar-wrap"><div class="upd-bar" id="atBar_geral"></div></div>
+        <div class="all-tenant-msg" id="atMsg_geral"></div>
+        <div class="upd-steps-list" style="max-height:160px;overflow-y:auto;">
+          <div class="upd-step-item" id="atS_geral_1"><span class="upd-step-icon">⬜</span>Usuários (todas as indústrias)</div>
         </div>
       </div>
     </div>
@@ -4686,7 +4697,6 @@ function runUpdateAll() {
     7:  'Salvar inatividade no Drive',
     8:  'Salvar De → Para no Drive',
     9:  'Salvar histórico de vendas no Drive',
-    10: 'Salvar usuários no Drive',
     11: 'Salvar Batalha Naval no Drive'
   };
 
@@ -4697,6 +4707,7 @@ function runUpdateAll() {
   function setStep(n, status) {
     // status: 'active' | 'done' | 'error'
     var el = document.getElementById('updS' + n);
+    if (!el) return;
     el.className = 'upd-step-item ' + status;
     if (status === 'done')   el.querySelector('.upd-step-icon').textContent = '✅';
     if (status === 'active') el.querySelector('.upd-step-icon').textContent = '🔄';
@@ -6277,14 +6288,19 @@ function reloadUsuarios() {
 }
 
 function fetchUsuarios(type) {
-  var endpoint = type === 'distrib' ? '/usuarios-distribuidores' : '/usuarios-industria';
   var tbody    = document.getElementById(type === 'distrib' ? 'tbodyDistrib' : 'tbodyIndustria');
   var cols     = type === 'distrib' ? 3 : 2;
   tbody.innerHTML = '<tr><td colspan="' + cols + '" style="text-align:center;color:var(--text3);padding:32px">Carregando…</td></tr>';
 
-  fetch(BACKEND + endpoint)
+  // /usuarios é a extração geral (todas as indústrias); aqui filtra só o BIC
+  fetch(BACKEND + '/usuarios')
     .then(function(r) { if (!r.ok) throw new Error(r.statusText); return r.json(); })
-    .then(function(data) {
+    .then(function(todos) {
+      var data = todos.filter(function(r) {
+        return r.Industria === 'BIC' && r.Tipo === (type === 'industria' ? 'Indústria' : 'Distribuidor');
+      }).map(function(r) {
+        return { account_name: r.Empresa, user_name: r.Nome, email: r.Email, has_permission: r.Tem_Permissao === 'Sim' };
+      });
       var st = usuariosState[type];
       st.rows    = data;
       st.loaded  = true;
@@ -8371,7 +8387,7 @@ function runUpdateAllTenants() {
   btn.disabled = true;
 
   // Reset todos os steps e barras
-  ['asa','bic','bombril','cicopal','fini','fruki','gallo','gtex','kibon','mdias','mdiassaud','marilan','peccin','pepsico'].forEach(function(t) {
+  ['asa','bic','bombril','cicopal','fini','fruki','gallo','gtex','kibon','mdias','mdiassaud','marilan','peccin','pepsico','geral'].forEach(function(t) {
     document.getElementById('atBar_' + t).style.width      = '0%';
     document.getElementById('atBar_' + t).style.background = 'var(--accent)';
     document.getElementById('atMsg_' + t).textContent      = '';
@@ -8385,14 +8401,14 @@ function runUpdateAllTenants() {
   });
   panel.classList.add('visible');
 
-  var done   = { asa: false, bic: false, bombril: false, cicopal: false, fini: false, fruki: false, gallo: false, gtex: false, kibon: false, mdias: false, mdiassaud: false, marilan: false, peccin: false, pepsico: false };
-  var errors = { asa: false, bic: false, bombril: false, cicopal: false, fini: false, fruki: false, gallo: false, gtex: false, kibon: false, mdias: false, mdiassaud: false, marilan: false, peccin: false, pepsico: false };
+  var done   = { asa: false, bic: false, bombril: false, cicopal: false, fini: false, fruki: false, gallo: false, gtex: false, kibon: false, mdias: false, mdiassaud: false, marilan: false, peccin: false, pepsico: false, geral: false };
+  var errors = { asa: false, bic: false, bombril: false, cicopal: false, fini: false, fruki: false, gallo: false, gtex: false, kibon: false, mdias: false, mdiassaud: false, marilan: false, peccin: false, pepsico: false, geral: false };
 
   function checkAllDone() {
-    if (!done.asa || !done.bic || !done.bombril || !done.cicopal || !done.fini || !done.fruki || !done.gallo || !done.gtex || !done.kibon || !done.mdias || !done.mdiassaud || !done.marilan || !done.peccin || !done.pepsico) return;
+    if (!done.asa || !done.bic || !done.bombril || !done.cicopal || !done.fini || !done.fruki || !done.gallo || !done.gtex || !done.kibon || !done.mdias || !done.mdiassaud || !done.marilan || !done.peccin || !done.pepsico || !done.geral) return;
     _allTenantsRunning = false;
     btn.disabled = false;
-    var hasError = errors.asa || errors.bic || errors.bombril || errors.cicopal || errors.fini || errors.fruki || errors.gallo || errors.gtex || errors.kibon || errors.mdias || errors.mdiassaud || errors.marilan || errors.peccin || errors.pepsico;
+    var hasError = errors.asa || errors.bic || errors.bombril || errors.cicopal || errors.fini || errors.fruki || errors.gallo || errors.gtex || errors.kibon || errors.mdias || errors.mdiassaud || errors.marilan || errors.peccin || errors.pepsico || errors.geral;
     showToast(hasError ? '⚠️ Atualização concluída com erros.' : '✓ Todos os ambientes atualizados!',
       hasError ? 'error' : 'success', 6000);
   }
@@ -8476,6 +8492,7 @@ function runUpdateAllTenants() {
   connectTenant('mdias',     '/mdias/atualizar-tudo', 7);
   connectTenant('mdiassaud', '/mdiassaud/atualizar-tudo', 7);
   connectTenant('marilan',   '/marilan/atualizar-tudo', 7);
+  connectTenant('geral',     '/geral/atualizar-tudo', 1);
 }
 
 var _mdiasUpdRunning = false;

@@ -1134,10 +1134,7 @@ app.get('/atualizar-tudo', async (req, res) => {
     await saveHistoricoToDrive(historicoRows);
     emit(99, 9, 'Histórico salvo no Drive.');
 
-    // ── PASSO 10: Salvar Usuários no Drive ────────────────
-    emit(97, 10, 'Salvando snapshot de usuários no Drive…');
-    await saveUsuariosToDrive();
-    emit(98, 10, 'Usuários salvos no Drive.');
+    // (Passo 10 — usuários — saiu daqui: agora é extração geral em /geral/atualizar-tudo)
 
     // ── PASSO 11: Batalha Naval no Drive ──────────────────
     emit(99, 11, 'Salvando Batalha Naval no Drive…');
@@ -1158,106 +1155,147 @@ app.get('/atualizar-tudo', async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-//  Usuários — salvar snapshot no Drive
+//  GERAL — extrações sem vínculo de indústria
+//  GET /geral/atualizar-tudo (SSE) — roda na atualização diária (scripts/atualizar-todos.js)
 // ─────────────────────────────────────────
-async function saveUsuariosToDrive() {
-  try {
-    const drive    = getDriveClient();
-    const folderId = process.env.GOOGLE_DRIVE_USUARIOS_FOLDER_ID;
 
-    const now = new Date();
-    const dd  = String(now.getDate()).padStart(2, '0');
-    const mm  = String(now.getMonth() + 1).padStart(2, '0');
-    const yyyy = now.getFullYear();
-    const filename = `usuarios_${dd}-${mm}-${yyyy}.xlsx`;
+// Indústrias do portal e como cada uma marca suas distribuidoras no Postgres.
+// Uma distribuidora só pertence à indústria se tiver OS DOIS:
+//   1) partnership ativa com a organização da indústria (orgId = uuid_partnerships), e
+//   2) o código da indústria em organization.project_list_array / organization.project (codigos)
+//      ou em organization.group_name (grupos — só M Dias; o mBic do group_name é desconsiderado).
+const INDUSTRIAS_USUARIOS = [
+  { nome: 'BIC',              orgId: '4d4e55fc-9320-4813-9cad-8ea8c357879e', codigos: ['mBic'] },
+  { nome: 'Asa',              orgId: '223dc5b2-5a36-4c77-b8cc-7e698143317e', codigos: ['ASA-IND'] },
+  { nome: 'Bombril',          orgId: '7872e618-32b1-4551-a7fc-887a805328b4', codigos: ['BOMBRIL'] },
+  { nome: 'Cicopal',          orgId: '66ce40b9-0a08-403e-a981-42413243b9f5', codigos: ['CICOPAL'] },
+  { nome: 'Fini',             orgId: 'bef7ab53-d284-4cd5-bbbb-bb638eacd320', codigos: ['FINI'] },
+  { nome: 'Fruki',            orgId: 'e2d95ccd-f0d3-434f-a2b9-e707f2e691f7', codigos: ['FRUKI'] },
+  { nome: 'Gallo',            orgId: '9a778ecf-9835-4c10-b977-fd333f1c6a3f', codigos: ['GALLO'] },
+  { nome: 'Gtex',             orgId: 'fc281653-c8ec-46f2-9c59-41f42ef3fd82', codigos: ['GTEX'] },
+  { nome: 'Kibon',            orgId: '6d2fa84a-c01a-4c79-a8b2-3b557319ebc5', codigos: ['UNILEVER-KIBON'] },
+  { nome: 'Marilan',          orgId: '6c09c425-a40e-4135-8be1-4d76f494d653', codigos: ['MARILAN'] },
+  { nome: 'M Dias',           orgId: '04645518-424f-44a1-a1f8-7128a253b923', codigos: ['MDIAS', 'mDiasBranco'], grupos: ['mDiasBranco'] },
+  { nome: 'M Dias Saudáveis', orgId: '0c30a4c7-6c65-4f2e-b7ea-c8dff61ef0f2', codigos: ['saudaveis'],            grupos: ['mDiasBrancoSaudaveis'] },
+  { nome: 'Peccin',           orgId: '2bb30205-3b55-4bf7-bc72-5ce17793ed79', codigos: ['PECCIN'] },
+  { nome: 'Pepsico',          orgId: 'a90f7541-97b5-4da5-a133-76422d1982f2', codigos: ['PEPSICO'] },  { nome: 'Ultracheese',      orgId: '27c5050f-b03a-40e2-ad18-5fee264974b9', codigos: ['ULTRACHEESE'] },
+];
 
-    const [distribResult, industriaResult] = await Promise.all([
-      pgPool.query(SQL_DISTRIB),
-      pgPool.query(SQL_INDUSTRIA),
-    ]);
-
-    const distribRows = distribResult.rows.map(r => ({
-      Empresa:        r.account_name,
-      Nome:           r.user_name,
-      Email:          r.email,
-      Tem_Permissao:  r.has_permission ? 'Sim' : 'Não',
-    }));
-    const industriaRows = industriaResult.rows.map(r => ({ Nome: r.user_name, Email: r.email }));
-
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(distribRows),   'Distribuidores');
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(industriaRows), 'Industria');
-    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-
-    const up = await uploadDailyXlsx(drive, folderId, filename, buffer, hashData({ distribRows, industriaRows }));
-    if (!up.skipped) console.log(`[Drive] Usuários salvos: "${filename}" (${distribResult.rowCount} distrib. + ${industriaResult.rowCount} indústria).`);
-  } catch (err) {
-    console.error('[Drive] Erro ao salvar usuários:', err.message);
-  }
-}
-
-// ─────────────────────────────────────────
-//  Usuários — distribuidoras
-// ─────────────────────────────────────────
-const SQL_DISTRIB = `
-  SELECT DISTINCT
+// Usuários de todas as organizações ativas (consulta aberta, sem filtro de indústria)
+const SQL_USUARIOS_GERAL = `
+  SELECT
+    o.id::text   AS organization_id,
+    o.account_name,
     uo.user_name,
     uo.user_id,
-    o.account_name,
-    o.id,
     uo.email,
-    CASE WHEN up.id_user IS NOT NULL THEN true ELSE false END AS has_permission
+    uo.profile_name,
+    EXISTS (
+      SELECT 1 FROM user_permission up
+       WHERE up.id_user = uo.user_id
+         AND up.id_permission = 'ed1fc65f-f7ba-457f-a8b2-dd963999ed4b'
+         AND up.uuid_organization = uo.organization_id
+    ) AS has_permission
   FROM public.user_organization AS uo
-  LEFT JOIN organization o   ON uo.organization_id = o.id
-  LEFT JOIN partnership p    ON p.uuid_organization::uuid = o.id
-  LEFT JOIN user_permission up
-    ON up.id_user = uo.user_id
-   AND up.id_permission = 'ed1fc65f-f7ba-457f-a8b2-dd963999ed4b'
-   AND up.uuid_organization = uo.organization_id
+  JOIN organization o ON uo.organization_id = o.id AND o.delete_on IS NULL
   WHERE uo.profile_name <> 'VENDEDOR'
-    AND 'mBic' = ANY(o.project_list_array)
     AND uo.email NOT LIKE '%sellers%'
-    AND o.account_name NOT IN ('BIC')
     AND uo.delete_on IS NULL
   ORDER BY o.account_name, uo.user_name
 `;
 
-const SQL_INDUSTRIA = `
-  SELECT DISTINCT
-    uo.user_name,
-    o.account_name,
-    o.id,
-    uo.email
-  FROM public.user_organization AS uo
-  LEFT JOIN organization o ON uo.organization_id = o.id
-  LEFT JOIN partnership p  ON p.uuid_organization::uuid = o.id
-  WHERE uo.profile_name <> 'VENDEDOR'
-    AND 'mBic' = ANY(o.project_list_array)
-    AND uo.email NOT LIKE '%sellers%'
-    AND o.account_name IN ('BIC')
-    AND uo.delete_on IS NULL
-  ORDER BY uo.user_name
+// Códigos e parcerias de cada organização ativa
+const SQL_VINCULOS_GERAL = `
+  SELECT o.id::text AS organization_id,
+         COALESCE(o.project_list_array, '{}') || CASE WHEN o.project IS NULL THEN '{}'::varchar[] ELSE ARRAY[o.project]::varchar[] END AS codigos,
+         o.group_name AS grupo,
+         ARRAY(SELECT p.uuid_partnerships FROM partnership p
+                WHERE p.uuid_organization = o.id::text AND p.delete_on IS NULL AND p.finished_on IS NULL) AS parceiros
+    FROM organization o
+   WHERE o.delete_on IS NULL
 `;
 
-app.get('/usuarios-distribuidores', async (req, res) => {
-  try {
-    const result = await pgPool.query(SQL_DISTRIB);
-    res.json(result.rows);
-  } catch (err) {
-    console.error('[PG] Erro /usuarios-distribuidores:', err.message);
-    res.status(500).json({ error: 'Erro ao consultar PostgreSQL: ' + err.message });
+// Indústrias do portal de uma organização (vazio = nenhuma)
+function industriasDaOrg(orgId, v) {
+  const propria = INDUSTRIAS_USUARIOS.find(i => i.orgId === orgId);
+  if (propria) return [{ ind: propria, tipo: 'Indústria' }];
+  if (!v) return [];
+  return INDUSTRIAS_USUARIOS
+    .filter(i => (v.parceiros || []).includes(i.orgId)
+      && ((v.codigos || []).some(c => i.codigos.includes(c)) || (i.grupos || []).includes(v.grupo)))
+    .map(ind => ({ ind, tipo: 'Distribuidor' }));
+}
+
+// Uma linha por usuário × organização × indústria (só vínculos válidos)
+async function consultarUsuariosGeral() {
+  const [usu, vinc] = await Promise.all([pgPool.query(SQL_USUARIOS_GERAL), pgPool.query(SQL_VINCULOS_GERAL)]);
+  const porOrg = new Map(vinc.rows.map(v => [v.organization_id, v]));
+  const linhas = [];
+  for (const r of usu.rows) {
+    for (const { ind, tipo } of industriasDaOrg(r.organization_id, porOrg.get(r.organization_id))) {
+      linhas.push({
+        Industria:      ind.nome,
+        Tipo:           tipo,
+        Empresa:        r.account_name,
+        Id_Organizacao: r.organization_id,
+        Nome:           r.user_name,
+        Id_Usuario:     r.user_id,
+        Email:          r.email,
+        Perfil:         r.profile_name,
+        Tem_Permissao:  r.has_permission ? 'Sim' : 'Não',
+      });
+    }
   }
+  return linhas;
+}
+
+// Snapshot diário: usuarios_DD-MM-AAAA.xlsx, aba "Usuarios", na pasta GOOGLE_DRIVE_USUARIOS_FOLDER_ID
+async function saveUsuariosToDrive() {
+  const drive    = getDriveClient();
+  const folderId = process.env.GOOGLE_DRIVE_USUARIOS_FOLDER_ID;
+
+  const now = new Date();
+  const dd  = String(now.getDate()).padStart(2, '0');
+  const mm  = String(now.getMonth() + 1).padStart(2, '0');
+  const yyyy = now.getFullYear();
+  const filename = `usuarios_${dd}-${mm}-${yyyy}.xlsx`;
+
+  const rows = await consultarUsuariosGeral();
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows), 'Usuarios');
+  const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+  const up = await uploadDailyXlsx(drive, folderId, filename, buffer, hashData(rows));
+  if (!up.skipped) console.log(`[Drive] Usuários (geral) salvos: "${filename}" (${rows.length} linhas).`);
+  return { linhas: rows.length, skipped: !!up.skipped };
+}
+
+app.get('/geral/atualizar-tudo', async (req, res) => {
+  res.setHeader('Content-Type',  'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection',    'keep-alive');
+  res.flushHeaders();
+  const emit = (pct, step, msg) => res.write(`data: ${JSON.stringify({ pct, step, msg })}\n\n`);
+
+  try {
+    // ── PASSO 1: Usuários (Postgres → Drive) ─────────────
+    emit(10, 1, 'Consultando usuários (PostgreSQL)…');
+    const u = await saveUsuariosToDrive();
+    emit(100, 1, u.skipped ? `Usuários sem mudança (${u.linhas}).` : `Usuários salvos no Drive (${u.linhas}).`);
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+  } catch (err) {
+    console.error('[geral/atualizar-tudo] Erro:', err.message);
+    res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+  }
+  res.end();
 });
 
-// ─────────────────────────────────────────
-//  Usuários — indústria (account_name IN ('BIC'))
-// ─────────────────────────────────────────
-app.get('/usuarios-industria', async (req, res) => {
+app.get('/usuarios', async (req, res) => {
   try {
-    const result = await pgPool.query(SQL_INDUSTRIA);
-    res.json(result.rows);
+    res.json(await consultarUsuariosGeral());
   } catch (err) {
-    console.error('[PG] Erro /usuarios-industria:', err.message);
+    console.error('[PG] Erro /usuarios:', err.message);
     res.status(500).json({ error: 'Erro ao consultar PostgreSQL: ' + err.message });
   }
 });

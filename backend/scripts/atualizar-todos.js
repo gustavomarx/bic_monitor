@@ -30,6 +30,7 @@ const CLIENTES = [
   { nome: 'Kibon',            rota: '/kibon' },
   { nome: 'Pepsico',          rota: '/pepsico' },
   { nome: 'Peccin',           rota: '/peccin' },
+  { nome: 'Geral',            rota: '/geral' },  // extrações sem vínculo de indústria (usuários)
 ];
 
 // ── Log ──────────────────────────────────
